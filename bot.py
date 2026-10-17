@@ -6,6 +6,7 @@ Telegram-бот: калькулятор межгорода (aiogram 3).
     python bot.py
 """
 import asyncio
+import json
 import math
 import os
 from copy import deepcopy
@@ -35,6 +36,40 @@ DEFAULTS = {
 TOLL_BEFORE_URGENT = False
 
 USER_SETTINGS: dict[int, dict] = {}
+
+# Файл настроек. На Bothost данные в /app/data переживают обновления бота.
+DATA_DIR = os.getenv("DATA_DIR") or ("/app/data" if os.path.isdir("/app/data") else ".")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        print("Не удалось прочитать настройки:", e)
+        return
+    for uid, st in raw.items():
+        base = deepcopy(DEFAULTS)
+        for k in ("normal", "high"):
+            base[k].update(st.get(k, {}))
+        for k in ("urgent_on", "urgent_pct", "mode"):
+            if k in st:
+                base[k] = st[k]
+        USER_SETTINGS[int(uid)] = base
+
+
+def save_settings():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in USER_SETTINGS.items()}, f, ensure_ascii=False)
+        os.replace(tmp, SETTINGS_FILE)
+    except Exception as e:
+        print("Не удалось сохранить настройки:", e)
 
 
 class Form(StatesGroup):
@@ -154,6 +189,7 @@ async def back(c: CallbackQuery):
 async def toggle_mode(c: CallbackQuery):
     s = settings_of(c.from_user.id)
     s["mode"] = "double" if s["mode"] == "normal" else "normal"
+    save_settings()
     await c.message.edit_reply_markup(reply_markup=main_kb(s))
     await c.answer()
 
@@ -162,6 +198,7 @@ async def toggle_mode(c: CallbackQuery):
 async def toggle_urgent(c: CallbackQuery):
     s = settings_of(c.from_user.id)
     s["urgent_on"] = not s["urgent_on"]
+    save_settings()
     await c.message.edit_reply_markup(reply_markup=main_kb(s))
     await c.answer()
     if s["urgent_on"]:
@@ -180,6 +217,7 @@ async def set_urgent(m: Message):
         return
     s = settings_of(m.from_user.id)
     s["urgent_pct"] = int(pct) if pct.is_integer() else pct
+    save_settings()
     await m.answer(f"Срочность: {s['urgent_pct']}%", reply_markup=main_kb(s))
 
 
@@ -211,6 +249,7 @@ async def save_tariff(m: Message, state: FSMContext):
     d = await state.get_data()
     s = settings_of(m.from_user.id)
     s[d["group"]][d["tariff"]] = int(val) if val.is_integer() else val
+    save_settings()
     await state.clear()
     await m.answer(tariffs_text(s), reply_markup=tariffs_kb(s), parse_mode="HTML")
 
@@ -306,6 +345,7 @@ async def got_toll(m: Message, state: FSMContext):
 
 
 async def main():
+    load_settings()
     bot = Bot(os.environ["BOT_TOKEN"])
     await dp.start_polling(bot)
 
