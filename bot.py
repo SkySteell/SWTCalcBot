@@ -120,15 +120,41 @@ def round100(x):
     return int(math.floor(x / 100 + 0.5) * 100)
 
 
-def price(s, tariff, legs, toll):
+def _r(x):
+    return int(math.floor(x + 0.5))
+
+
+def breakdown(s, tariff, legs, toll):
+    """Возвращает (части, платные_дороги, сумма, итог_до_сотни).
+    части — список (сумма, подпись): отрезки маршрута с типом тарифа."""
+    k = 1 + s["urgent_pct"] / 100 if s["urgent_on"] else 1
     if s["mode"] == "double":
         first, second = ("high", "normal") if s.get("reverse") else ("normal", "high")
-        base = legs[0] * s[first][tariff] + legs[1] * s[second][tariff]
+        names = {"normal": "обычный", "high": "повышенный"}
+        parts = [(_r(legs[0] * s[first][tariff] * k), names[first]),
+                 (_r(legs[1] * s[second][tariff] * k), names[second])]
     else:
-        base = legs[0] * s["normal"][tariff]
-    k = 1 + s["urgent_pct"] / 100 if s["urgent_on"] else 1
-    total = (base + toll) * k if TOLL_BEFORE_URGENT else base * k + toll
-    return round100(total)
+        parts = [(_r(legs[0] * s["normal"][tariff] * k), "расчёт")]
+    toll_part = _r(toll * k) if TOLL_BEFORE_URGENT else _r(toll)
+    exact = sum(a for a, _ in parts) + toll_part
+    return parts, toll_part, exact, round100(exact)
+
+
+def price(s, tariff, legs, toll):
+    return breakdown(s, tariff, legs, toll)[3]
+
+
+def format_tariff(s, tariff, legs, toll):
+    parts, toll_part, exact, total = breakdown(s, tariff, legs, toll)
+    terms = [f"{money(a)} ({label})" for a, label in parts]
+    if toll_part:
+        terms.append(f"{money(toll_part)} (платные дороги)")
+    out = [f"<b>{tariff}</b>"]
+    if len(terms) > 1 or exact != total:
+        eq = " + ".join(terms)
+        out.append(f"{eq} = {money(exact)} ₽" if len(terms) > 1 else f"{money(exact)} ₽ ({parts[0][1]})")
+    out.append(f"Итог: <b>{money(total)} ₽</b>")
+    return "\n".join(out)
 
 
 def money(x):
@@ -372,9 +398,8 @@ async def got_toll(m: Message, state: FSMContext):
     else:
         lines.append(f"Расстояние: {legs[0]:.1f} км")
     lines.append("")
-    for t in TARIFFS:
-        if cs["enabled"].get(t, True):
-            lines.append(f"• {t}: <b>{money(price(cs, t, legs, toll))}</b> ₽")
+    blocks = [format_tariff(cs, t, legs, toll) for t in TARIFFS if cs["enabled"].get(t, True)]
+    lines.append("\n\n".join(blocks))
     extra = []
     if toll:
         extra.append(f"платные дороги: {money(round(toll))} ₽")
