@@ -29,6 +29,8 @@ DEFAULTS = {
     "urgent_on": False,
     "urgent_pct": 20,
     "mode": "normal",  # normal | double
+    "reverse": False,  # двойная тарификация: False = обычный → повышенный, True = наоборот
+    "enabled": {t: True for t in TARIFFS},  # какие тарифы показывать в расчёте
 }
 
 # True  — платные дороги прибавляются до наценки за срочность (20% берётся и с них)
@@ -55,7 +57,8 @@ def load_settings():
         base = deepcopy(DEFAULTS)
         for k in ("normal", "high"):
             base[k].update(st.get(k, {}))
-        for k in ("urgent_on", "urgent_pct", "mode"):
+        base["enabled"].update(st.get("enabled", {}))
+        for k in ("urgent_on", "urgent_pct", "mode", "reverse"):
             if k in st:
                 base[k] = st[k]
         USER_SETTINGS[int(uid)] = base
@@ -119,7 +122,8 @@ def round100(x):
 
 def price(s, tariff, legs, toll):
     if s["mode"] == "double":
-        base = legs[0] * s["normal"][tariff] + legs[1] * s["high"][tariff]
+        first, second = ("high", "normal") if s.get("reverse") else ("normal", "high")
+        base = legs[0] * s[first][tariff] + legs[1] * s[second][tariff]
     else:
         base = legs[0] * s["normal"][tariff]
     k = 1 + s["urgent_pct"] / 100 if s["urgent_on"] else 1
@@ -139,27 +143,37 @@ def settings_of(uid):
 def main_kb(s):
     mode_txt = "Обычный расчёт" if s["mode"] == "normal" else "Двойная тарификация"
     urgent_txt = f"Срочная: {'вкл' if s['urgent_on'] else 'выкл'} ({s['urgent_pct']}%)"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Режим: {mode_txt}", callback_data="mode")],
+    rows = [[InlineKeyboardButton(text=f"Режим: {mode_txt}", callback_data="mode")]]
+    if s["mode"] == "double":
+        dir_txt = ("повышенный → обычный" if s.get("reverse")
+                   else "обычный → повышенный")
+        rows.append([InlineKeyboardButton(text=f"Порядок: {dir_txt}",
+                                          callback_data="reverse")])
+    rows += [
         [InlineKeyboardButton(text="Тарифы", callback_data="tariffs")],
         [InlineKeyboardButton(text=urgent_txt, callback_data="urgent")],
         [InlineKeyboardButton(text="🧮 Рассчитать поездку", callback_data="calc")],
-    ])
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def tariffs_text(s):
     title = "Обычная часть маршрута" if s["mode"] == "double" else "Тарифы"
     txt = f"<b>{title} (₽/км)</b>\n"
-    txt += "\n".join(f"{t}: {s['normal'][t]}" for t in TARIFFS)
+    mark = lambda t: "✅" if s["enabled"].get(t, True) else "⬜"
+    txt += "\n".join(f"{mark(t)} {t}: {s['normal'][t]}" for t in TARIFFS)
     if s["mode"] == "double":
-        txt += "\n\n<b>Повышенный тариф, второй отрезок (₽/км)</b>\n"
-        txt += "\n".join(f"{t}: {s['high'][t]}" for t in TARIFFS)
+        txt += "\n\n<b>Повышенный тариф (₽/км)</b>\n"
+        txt += "\n".join(f"{mark(t)} {t}: {s['high'][t]}" for t in TARIFFS)
+    txt += "\n\n✅ — показывается в расчёте, ⬜ — скрыт"
     return txt
 
 
 def tariffs_kb(s):
     rows = [[InlineKeyboardButton(text=f"{t}: {s['normal'][t]}",
-                                  callback_data=f"edit:normal:{t}")] for t in TARIFFS]
+                                  callback_data=f"edit:normal:{t}"),
+             InlineKeyboardButton(text="✅ вкл" if s["enabled"].get(t, True) else "⬜ выкл",
+                                  callback_data=f"toggle:{t}")] for t in TARIFFS]
     if s["mode"] == "double":
         rows += [[InlineKeyboardButton(text=f"Повышенный · {t}: {s['high'][t]}",
                                        callback_data=f"edit:high:{t}")] for t in TARIFFS]
@@ -191,6 +205,32 @@ async def toggle_mode(c: CallbackQuery):
     s["mode"] = "double" if s["mode"] == "normal" else "normal"
     save_settings()
     await c.message.edit_reply_markup(reply_markup=main_kb(s))
+    await c.answer()
+
+
+@dp.callback_query(F.data == "reverse")
+async def toggle_reverse(c: CallbackQuery):
+    s = settings_of(c.from_user.id)
+    s["reverse"] = not s.get("reverse", False)
+    save_settings()
+    await c.message.edit_reply_markup(reply_markup=main_kb(s))
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("toggle:"))
+async def toggle_tariff(c: CallbackQuery):
+    t = c.data.split(":", 1)[1]
+    s = settings_of(c.from_user.id)
+    if t not in TARIFFS:
+        await c.answer()
+        return
+    if s["enabled"].get(t, True) and sum(s["enabled"].get(x, True) for x in TARIFFS) == 1:
+        await c.answer("Должен остаться хотя бы один тариф", show_alert=True)
+        return
+    s["enabled"][t] = not s["enabled"].get(t, True)
+    save_settings()
+    await c.message.edit_text(tariffs_text(s) + "\n\nНажмите на тариф, чтобы изменить цену.",
+                              reply_markup=tariffs_kb(s), parse_mode="HTML")
     await c.answer()
 
 
@@ -326,13 +366,15 @@ async def got_toll(m: Message, state: FSMContext):
     lines = [f"<b>{' → '.join(n.strip() for n in names)}</b>",
              "Найдено: " + " → ".join(p[3] for p in points)]
     if cs["mode"] == "double":
+        lab = ("повышенный", "обычный") if cs.get("reverse") else ("обычный", "повышенный")
         lines.append(f"Расстояние: {sum(legs):.1f} км "
-                     f"({legs[0]:.1f} + {legs[1]:.1f})")
+                     f"({legs[0]:.1f} {lab[0]} + {legs[1]:.1f} {lab[1]})")
     else:
         lines.append(f"Расстояние: {legs[0]:.1f} км")
     lines.append("")
     for t in TARIFFS:
-        lines.append(f"• {t}: <b>{money(price(cs, t, legs, toll))}</b> ₽")
+        if cs["enabled"].get(t, True):
+            lines.append(f"• {t}: <b>{money(price(cs, t, legs, toll))}</b> ₽")
     extra = []
     if toll:
         extra.append(f"платные дороги: {money(round(toll))} ₽")
