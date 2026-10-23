@@ -9,6 +9,7 @@ import asyncio
 import json
 import math
 import os
+import time
 from copy import deepcopy
 
 import aiohttp
@@ -73,6 +74,119 @@ def save_settings():
         os.replace(tmp, SETTINGS_FILE)
     except Exception as e:
         print("Не удалось сохранить настройки:", e)
+
+
+# ---------- платный доступ: пробный период + разовый донат ----------
+# Всё настраивается переменными окружения на хостинге:
+#   PAID_MODE=1       — включить платный режим (по умолчанию выключен, бот бесплатный)
+#   ADMIN_ID=123456   — ваш Telegram ID (узнать: команда /id), сюда приходят заявки об оплате
+#   DONATE_INFO=...   — текст с реквизитами и суммой доната, его увидят пользователи
+#   TRIAL_DAYS=3      — длительность пробного периода
+PAID_MODE = os.getenv("PAID_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "3") or 3)
+DONATE_INFO = os.getenv("DONATE_INFO", "").strip()
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+USERS: dict[int, dict] = {}
+CLAIM_COOLDOWN = 600  # секунд между заявками «Я оплатил» от одного человека
+
+
+def load_users():
+    try:
+        with open(USERS_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        print("Не удалось прочитать пользователей:", e)
+        return
+    for uid, u in raw.items():
+        USERS[int(uid)] = u
+
+
+def save_users():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = USERS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in USERS.items()}, f, ensure_ascii=False)
+        os.replace(tmp, USERS_FILE)
+    except Exception as e:
+        print("Не удалось сохранить пользователей:", e)
+
+
+def new_user_record():
+    return {"first_seen": time.time(), "paid": False, "until": None}
+
+
+def register_user(user):
+    u = USERS.get(user.id)
+    changed = False
+    if u is None:
+        u = USERS[user.id] = new_user_record()
+        changed = True
+    name, uname = user.full_name or "", user.username or ""
+    if u.get("name") != name or u.get("username") != uname:
+        u["name"], u["username"] = name, uname
+        changed = True
+    if changed:
+        save_users()
+    return u
+
+
+def paid_active(u):
+    return bool(u.get("paid")) and (u.get("until") is None or u["until"] > time.time())
+
+
+def trial_left_days(u):
+    left = TRIAL_DAYS * 86400 - (time.time() - u["first_seen"])
+    return math.ceil(left / 86400) if left > 0 else 0
+
+
+def has_access(user):
+    if not PAID_MODE or user.id == ADMIN_ID:
+        return True
+    u = register_user(user)
+    return paid_active(u) or trial_left_days(u) > 0
+
+
+def state_text(u):
+    if paid_active(u):
+        if u.get("until") is None:
+            return "оплачено (навсегда)"
+        return "оплачено до " + time.strftime("%d.%m.%Y", time.localtime(u["until"]))
+    days = trial_left_days(u)
+    return f"пробный период, осталось дней: {days}" if days else "пробный период закончился"
+
+
+def access_status(user):
+    if not PAID_MODE or user.id == ADMIN_ID:
+        return ""
+    u = register_user(user)
+    if paid_active(u):
+        return "Доступ открыт."
+    days = trial_left_days(u)
+    return f"Пробный период: осталось дней — {days}." if days else "Пробный период закончился."
+
+
+def paywall_text():
+    txt = ("Пробный период закончился. Чтобы продолжить пользоваться ботом, "
+           "поддержите проект донатом — после этого доступ открывается насовсем.")
+    if DONATE_INFO:
+        txt += "\n\n" + DONATE_INFO
+    txt += ("\n\nПосле перевода нажмите «Я оплатил»: администратор проверит поступление "
+            "и откроет доступ.")
+    return txt
+
+
+def paywall_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Я оплатил", callback_data="paid_claim")]])
+
+
+def user_label(user):
+    uname = f" (@{user.username})" if user.username else ""
+    return f"{user.full_name}{uname}"
 
 
 class Form(StatesGroup):
@@ -214,8 +328,131 @@ dp = Dispatcher(storage=MemoryStorage())
 async def start(m: Message, state: FSMContext):
     await state.clear()
     s = settings_of(m.from_user.id)
-    await m.answer("Калькулятор межгорода.\nНастройте параметры или сразу жмите «Рассчитать».",
-                   reply_markup=main_kb(s))
+    text = "Калькулятор межгорода.\nНастройте параметры или сразу жмите «Рассчитать»."
+    status = access_status(m.from_user)
+    if status:
+        text += "\n\n" + status
+    await m.answer(text, reply_markup=main_kb(s))
+
+
+@dp.message(Command("id"))
+async def my_id(m: Message):
+    await m.answer(f"Ваш Telegram ID: {m.from_user.id}")
+
+
+def is_admin(m: Message):
+    return bool(ADMIN_ID) and m.from_user.id == ADMIN_ID
+
+
+@dp.message(Command("grant"))
+async def grant(m: Message):
+    if not is_admin(m):
+        return
+    parts = (m.text or "").split()
+    try:
+        uid = int(parts[1])
+        days = int(parts[2]) if len(parts) > 2 else None
+        assert days is None or days > 0
+    except Exception:
+        await m.answer("Формат: /grant ID [дней]. Без числа дней доступ открывается навсегда.")
+        return
+    u = USERS.setdefault(uid, new_user_record())
+    u["paid"] = True
+    u["until"] = None if days is None else time.time() + days * 86400
+    save_users()
+    await m.answer(f"Пользователь {uid}: {state_text(u)}")
+    try:
+        await m.bot.send_message(uid, "Вам открыт доступ к боту. Спасибо!")
+    except Exception:
+        pass
+
+
+@dp.message(Command("revoke"))
+async def revoke(m: Message):
+    if not is_admin(m):
+        return
+    parts = (m.text or "").split()
+    try:
+        uid = int(parts[1])
+    except Exception:
+        await m.answer("Формат: /revoke ID")
+        return
+    u = USERS.get(uid)
+    if not u:
+        await m.answer("Такого пользователя нет.")
+        return
+    u["paid"], u["until"] = False, None
+    save_users()
+    await m.answer(f"Пользователь {uid}: {state_text(u)}")
+
+
+@dp.message(Command("users"))
+async def users_list(m: Message):
+    if not is_admin(m):
+        return
+    if not USERS:
+        await m.answer("Пока никого нет. Список ведётся, когда включён PAID_MODE.")
+        return
+    paid = sum(paid_active(u) for u in USERS.values())
+    trial = sum((not paid_active(u)) and trial_left_days(u) > 0 for u in USERS.values())
+    expired = len(USERS) - paid - trial
+    lines = [f"Всего: {len(USERS)} · оплатили: {paid} · на пробном: {trial} · закончился пробный: {expired}", ""]
+    recent = sorted(USERS.items(), key=lambda kv: kv[1]["first_seen"], reverse=True)[:30]
+    for uid, u in recent:
+        uname = f" @{u['username']}" if u.get("username") else ""
+        lines.append(f"{uid} {u.get('name', '')}{uname} — {state_text(u)}")
+    await m.answer("\n".join(lines))
+
+
+@dp.callback_query(F.data == "paid_claim")
+async def paid_claim(c: CallbackQuery):
+    if has_access(c.from_user):
+        await c.answer("Доступ уже открыт", show_alert=True)
+        return
+    if not ADMIN_ID:
+        await c.answer("Приём оплаты не настроен, напишите администратору", show_alert=True)
+        return
+    u = register_user(c.from_user)
+    now = time.time()
+    if now - u.get("last_claim", 0) < CLAIM_COOLDOWN:
+        await c.answer("Заявка уже отправлена, дождитесь подтверждения", show_alert=True)
+        return
+    u["last_claim"] = now
+    save_users()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"adm_ok:{c.from_user.id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_no:{c.from_user.id}"),
+    ]])
+    await c.bot.send_message(
+        ADMIN_ID, f"Заявка об оплате\n{user_label(c.from_user)}\nID: {c.from_user.id}",
+        reply_markup=kb)
+    await c.message.answer("Заявка отправлена. Когда оплата будет подтверждена, я напишу вам.")
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_"))
+async def admin_decision(c: CallbackQuery):
+    if not ADMIN_ID or c.from_user.id != ADMIN_ID:
+        await c.answer("Нет доступа", show_alert=True)
+        return
+    action, uid_s = c.data.split(":", 1)
+    uid = int(uid_s)
+    u = USERS.setdefault(uid, new_user_record())
+    if action == "adm_ok":
+        u["paid"], u["until"] = True, None
+        save_users()
+        note, user_msg = "✅ Подтверждено", "Оплата подтверждена, доступ к боту открыт насовсем. Спасибо за поддержку!"
+    else:
+        u["last_claim"] = 0
+        save_users()
+        note, user_msg = "❌ Отклонено", ("Оплата не найдена. Если вы переводили деньги, "
+                                           "напишите администратору.")
+    try:
+        await c.bot.send_message(uid, user_msg)
+    except Exception:
+        pass
+    await c.message.edit_text((c.message.text or "") + "\n\n" + note)
+    await c.answer()
 
 
 @dp.callback_query(F.data == "back")
@@ -323,6 +560,10 @@ async def save_tariff(m: Message, state: FSMContext):
 # ---------- расчёт поездки ----------
 @dp.callback_query(F.data == "calc")
 async def calc_start(c: CallbackQuery, state: FSMContext):
+    if not has_access(c.from_user):
+        await c.message.answer(paywall_text(), reply_markup=paywall_kb())
+        await c.answer()
+        return
     await state.set_state(Form.point_a)
     await c.message.answer("Точка A — откуда? (город или адрес)")
     await c.answer()
@@ -413,6 +654,9 @@ async def got_toll(m: Message, state: FSMContext):
 
 async def main():
     load_settings()
+    load_users()
+    if PAID_MODE and not ADMIN_ID:
+        print("ВНИМАНИЕ: PAID_MODE включён, но ADMIN_ID не задан — оплаты некому подтверждать.")
     bot = Bot(os.environ["BOT_TOKEN"])
     await dp.start_polling(bot)
 
