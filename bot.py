@@ -21,18 +21,37 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
-TARIFFS = ["Стандарт", "Комфорт", "Комфорт+", "Минивэн"]
+CUSTOM = "Свой тариф"  # тариф, цену которого вписывает сам пользователь (по умолчанию выключен)
+TARIFFS = ["Стандарт", "Комфорт", "Комфорт+", "Минивэн", CUSTOM]
 
 # Значения по умолчанию (₽/км)
 DEFAULTS = {
-    "normal": {"Стандарт": 27, "Комфорт": 30, "Комфорт+": 35, "Минивэн": 50},
-    "high": {"Стандарт": 70, "Комфорт": 80, "Комфорт+": 90, "Минивэн": 110},
+    "normal": {"Стандарт": 27, "Комфорт": 30, "Комфорт+": 35, "Минивэн": 50, CUSTOM: 40},
+    "high": {"Стандарт": 70, "Комфорт": 80, "Комфорт+": 90, "Минивэн": 110, CUSTOM: 100},
     "urgent_on": False,
     "urgent_pct": 20,
     "mode": "normal",  # normal | double
-    "reverse": False,  # двойная тарификация: False = обычный → повышенный, True = наоборот
-    "enabled": {t: True for t in TARIFFS},  # какие тарифы показывать в расчёте
+    "order": "normal_high",  # порядок тарифов в двойной тарификации (см. ORDERS)
+    "enabled": {t: (t != CUSTOM) for t in TARIFFS},  # какие тарифы показывать в расчёте
 }
+
+# Порядок тарифов в режиме двойной тарификации: тип тарифа для 1-го и 2-го отрезка
+ORDERS = ["normal_high", "high_normal", "normal_normal"]
+ORDER_KINDS = {"normal_high": ("normal", "high"),
+               "high_normal": ("high", "normal"),
+               "normal_normal": ("normal", "normal")}
+ORDER_TITLE = {"normal_high": "обычный → повышенный",
+               "high_normal": "повышенный → обычный",
+               "normal_normal": "обычный → обычный"}
+KIND_NAME = {"normal": "обычный", "high": "повышенный"}
+
+
+def leg_kinds(s):
+    return ORDER_KINDS.get(s.get("order", "normal_high"), ORDER_KINDS["normal_high"])
+
+
+def uses_high(s):
+    return s["mode"] == "double" and "high" in leg_kinds(s)
 
 # True  — платные дороги прибавляются до наценки за срочность (20% берётся и с них)
 # False — срочность считается только с поездки, платные дороги прибавляются после
@@ -59,9 +78,13 @@ def load_settings():
         for k in ("normal", "high"):
             base[k].update(st.get(k, {}))
         base["enabled"].update(st.get("enabled", {}))
-        for k in ("urgent_on", "urgent_pct", "mode", "reverse"):
+        for k in ("urgent_on", "urgent_pct", "mode"):
             if k in st:
                 base[k] = st[k]
+        if st.get("order") in ORDERS:
+            base["order"] = st["order"]
+        elif st.get("reverse"):  # старый формат настроек
+            base["order"] = "high_normal"
         USER_SETTINGS[int(uid)] = base
 
 
@@ -82,10 +105,24 @@ def save_settings():
 #   ADMIN_ID=123456   — ваш Telegram ID (узнать: команда /id), сюда приходят заявки об оплате
 #   DONATE_INFO=...   — текст с реквизитами и суммой доната, его увидят пользователи
 #   TRIAL_DAYS=3      — длительность пробного периода
-PAID_MODE = os.getenv("PAID_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
-TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "3") or 3)
-DONATE_INFO = os.getenv("DONATE_INFO", "").strip()
+# Если на хостинге нет переменных окружения, те же параметры можно положить в файл
+# config.json в папке data: {"admin_id": 123456, "paid_mode": 1, "donate_info": "...", "trial_days": 3}
+def _read_config():
+    try:
+        with open(os.path.join(DATA_DIR, "config.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+CFG = _read_config()
+PAID_MODE = str(os.getenv("PAID_MODE") or CFG.get("paid_mode") or "0").strip().lower() in (
+    "1", "true", "yes", "on")
+ADMIN_ID = int(os.getenv("ADMIN_ID") or CFG.get("admin_id") or 0)
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS") or CFG.get("trial_days") or 3)
+DONATE_INFO = str(os.getenv("DONATE_INFO") or CFG.get("donate_info") or "").strip()
+SEEN_FILE = os.path.join(DATA_DIR, "seen_users.json")
+SEEN: dict[int, dict] = {}  # все, кто хоть раз открыл бота (для уведомлений о новых)
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 USERS: dict[int, dict] = {}
 CLAIM_COOLDOWN = 600  # секунд между заявками «Я оплатил» от одного человека
@@ -189,6 +226,46 @@ def user_label(user):
     return f"{user.full_name}{uname}"
 
 
+def load_seen():
+    try:
+        with open(SEEN_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        print("Не удалось прочитать список пользователей:", e)
+        return
+    for uid, u in raw.items():
+        SEEN[int(uid)] = u
+
+
+def save_seen():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = SEEN_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in SEEN.items()}, f, ensure_ascii=False)
+        os.replace(tmp, SEEN_FILE)
+    except Exception as e:
+        print("Не удалось сохранить список пользователей:", e)
+
+
+async def note_new_user(bot, user):
+    """Сообщает администратору, когда новый человек впервые открыл бота."""
+    if user.id in SEEN or user.id == ADMIN_ID:
+        return
+    SEEN[user.id] = {"name": user.full_name or "", "username": user.username or "",
+                     "first_seen": time.time()}
+    save_seen()
+    if ADMIN_ID:
+        try:
+            await bot.send_message(
+                ADMIN_ID, f"🆕 Новый пользователь: {user_label(user)}\n"
+                          f"ID: {user.id}\nВсего пользователей: {len(SEEN)}")
+        except Exception as e:
+            print("Не удалось отправить уведомление администратору:", e)
+
+
 class Form(StatesGroup):
     point_a = State()
     point_c = State()
@@ -243,10 +320,9 @@ def breakdown(s, tariff, legs, toll):
     части — список (сумма, подпись): отрезки маршрута с типом тарифа."""
     k = 1 + s["urgent_pct"] / 100 if s["urgent_on"] else 1
     if s["mode"] == "double":
-        first, second = ("high", "normal") if s.get("reverse") else ("normal", "high")
-        names = {"normal": "обычный", "high": "повышенный"}
-        parts = [(_r(legs[0] * s[first][tariff] * k), names[first]),
-                 (_r(legs[1] * s[second][tariff] * k), names[second])]
+        first, second = leg_kinds(s)
+        parts = [(_r(legs[0] * s[first][tariff] * k), KIND_NAME[first]),
+                 (_r(legs[1] * s[second][tariff] * k), KIND_NAME[second])]
     else:
         parts = [(_r(legs[0] * s["normal"][tariff] * k), "расчёт")]
     toll_part = _r(toll * k) if TOLL_BEFORE_URGENT else _r(toll)
@@ -285,10 +361,9 @@ def main_kb(s):
     urgent_txt = f"Срочная: {'вкл' if s['urgent_on'] else 'выкл'} ({s['urgent_pct']}%)"
     rows = [[InlineKeyboardButton(text=f"Режим: {mode_txt}", callback_data="mode")]]
     if s["mode"] == "double":
-        dir_txt = ("повышенный → обычный" if s.get("reverse")
-                   else "обычный → повышенный")
-        rows.append([InlineKeyboardButton(text=f"Порядок: {dir_txt}",
-                                          callback_data="reverse")])
+        rows.append([InlineKeyboardButton(
+            text=f"Порядок: {ORDER_TITLE[s.get('order', 'normal_high')]}",
+            callback_data="order")])
     rows += [
         [InlineKeyboardButton(text="Тарифы", callback_data="tariffs")],
         [InlineKeyboardButton(text=urgent_txt, callback_data="urgent")],
@@ -298,11 +373,11 @@ def main_kb(s):
 
 
 def tariffs_text(s):
-    title = "Обычная часть маршрута" if s["mode"] == "double" else "Тарифы"
+    title = "Обычный тариф" if s["mode"] == "double" else "Тарифы"
     txt = f"<b>{title} (₽/км)</b>\n"
     mark = lambda t: "✅" if s["enabled"].get(t, True) else "⬜"
     txt += "\n".join(f"{mark(t)} {t}: {s['normal'][t]}" for t in TARIFFS)
-    if s["mode"] == "double":
+    if uses_high(s):
         txt += "\n\n<b>Повышенный тариф (₽/км)</b>\n"
         txt += "\n".join(f"{mark(t)} {t}: {s['high'][t]}" for t in TARIFFS)
     txt += "\n\n✅ — показывается в расчёте, ⬜ — скрыт"
@@ -314,7 +389,7 @@ def tariffs_kb(s):
                                   callback_data=f"edit:normal:{t}"),
              InlineKeyboardButton(text="✅ вкл" if s["enabled"].get(t, True) else "⬜ выкл",
                                   callback_data=f"toggle:{t}")] for t in TARIFFS]
-    if s["mode"] == "double":
+    if uses_high(s):
         rows += [[InlineKeyboardButton(text=f"Повышенный · {t}: {s['high'][t]}",
                                        callback_data=f"edit:high:{t}")] for t in TARIFFS]
     rows.append([InlineKeyboardButton(text="← Назад", callback_data="back")])
@@ -327,6 +402,7 @@ dp = Dispatcher(storage=MemoryStorage())
 @dp.message(CommandStart())
 async def start(m: Message, state: FSMContext):
     await state.clear()
+    await note_new_user(m.bot, m.from_user)
     s = settings_of(m.from_user.id)
     text = "Калькулятор межгорода.\nНастройте параметры или сразу жмите «Рассчитать»."
     status = access_status(m.from_user)
@@ -471,10 +547,11 @@ async def toggle_mode(c: CallbackQuery):
     await c.answer()
 
 
-@dp.callback_query(F.data == "reverse")
-async def toggle_reverse(c: CallbackQuery):
+@dp.callback_query(F.data == "order")
+async def cycle_order(c: CallbackQuery):
     s = settings_of(c.from_user.id)
-    s["reverse"] = not s.get("reverse", False)
+    cur = s.get("order", "normal_high")
+    s["order"] = ORDERS[(ORDERS.index(cur) + 1) % len(ORDERS)]
     save_settings()
     await c.message.edit_reply_markup(reply_markup=main_kb(s))
     await c.answer()
@@ -560,6 +637,7 @@ async def save_tariff(m: Message, state: FSMContext):
 # ---------- расчёт поездки ----------
 @dp.callback_query(F.data == "calc")
 async def calc_start(c: CallbackQuery, state: FSMContext):
+    await note_new_user(c.bot, c.from_user)
     if not has_access(c.from_user):
         await c.message.answer(paywall_text(), reply_markup=paywall_kb())
         await c.answer()
@@ -575,7 +653,14 @@ async def got_a(m: Message, state: FSMContext):
     s = settings_of(m.from_user.id)
     if s["mode"] == "double":
         await state.set_state(Form.point_c)
-        await m.answer("Промежуточная точка — где заканчивается обычный тариф?")
+        order = s.get("order", "normal_high")
+        if order == "normal_normal":
+            q = "Промежуточная точка — через какую точку поедем? (весь маршрут по обычному тарифу)"
+        elif order == "high_normal":
+            q = "Промежуточная точка — где заканчивается повышенный тариф и начинается обычный?"
+        else:
+            q = "Промежуточная точка — где заканчивается обычный тариф и начинается повышенный?"
+        await m.answer(q)
     else:
         await state.set_state(Form.point_b)
         await m.answer("Точка B — куда?")
@@ -633,7 +718,7 @@ async def got_toll(m: Message, state: FSMContext):
     lines = [f"<b>{' → '.join(n.strip() for n in names)}</b>",
              "Найдено: " + " → ".join(p[3] for p in points)]
     if cs["mode"] == "double":
-        lab = ("повышенный", "обычный") if cs.get("reverse") else ("обычный", "повышенный")
+        lab = tuple(KIND_NAME[k] for k in leg_kinds(cs))
         lines.append(f"Расстояние: {sum(legs):.1f} км "
                      f"({legs[0]:.1f} {lab[0]} + {legs[1]:.1f} {lab[1]})")
     else:
@@ -655,6 +740,7 @@ async def got_toll(m: Message, state: FSMContext):
 async def main():
     load_settings()
     load_users()
+    load_seen()
     if PAID_MODE and not ADMIN_ID:
         print("ВНИМАНИЕ: PAID_MODE включён, но ADMIN_ID не задан — оплаты некому подтверждать.")
     bot = Bot(os.environ["BOT_TOKEN"])
